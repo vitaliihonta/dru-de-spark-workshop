@@ -1,18 +1,9 @@
 package com.dru
 
-import java.util.Properties
-import org.apache.spark.{Partitioner, SparkConf}
-import org.apache.spark.rdd.RDD
-import org.apache.spark.streaming._
-import org.json4s.DefaultFormats
-import org.json4s.jackson.Serialization._
-import scala.collection.mutable
+import org.apache.spark.SparkConf
 import scala.concurrent.{Await, ExecutionContext}
-import scala.concurrent.duration._
 import slick.jdbc.PostgresProfile.api._
-import com.typesafe.config._
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.streaming.dstream.DStream
 
 /**
   *
@@ -63,86 +54,6 @@ object StreamingExample {
       .setMaster("local[*]")
 
     val spark = SparkSession.builder().config(sparkConf).getOrCreate()
-    val ssc = new StreamingContext(spark.sparkContext, Durations.seconds(5))
-    ssc.checkpoint("spark-checkpoint")
-
-    val configBC = ssc.sparkContext.broadcast(ConfigFactory.load())
-
-    val filesStream: DStream[String] = {
-      val sc = ssc.sparkContext
-      ssc.queueStream[String](mutable.Queue[RDD[String]](
-        sc.textFile("src/main/resources/retail-jsons/2010-12-01.json"),
-        sc.textFile("src/main/resources/retail-jsons/2010-12-02.json")
-      ))
-    }
-
-    val retailDataStream: DStream[RetailData] = filesStream.map { json =>
-      implicit val formats = DefaultFormats
-      read[RetailData](json)
-    }
-
-    val stateSpec = StateSpec
-      .function { (stockCode: String, retailDataOpt: Option[RetailData], state: State[RetailData.ProductSummary]) =>
-        retailDataOpt match {
-          case None             =>
-            println(s"No data received for product $stockCode")
-          case Some(retailData) =>
-            val updatedState =
-              state.getOption()
-                .map(_ mergeValue retailData)
-                .getOrElse(RetailData.ProductSummary.fromData(retailData))
-
-            if (!state.exists()) {
-              println(s"Setting first state for product $stockCode")
-            }
-            state.update(updatedState)
-        }
-        stockCode -> state.getOption().getOrElse(RetailData.ProductSummary.Zero)
-      }
-      .initialState {
-        import spark.implicits._
-        spark
-          .read
-          .jdbc(
-            configBC.value.getString("retails.url"),
-            table = "product_summaries",
-            properties = {
-              val props = new Properties()
-              props.put("user", configBC.value.getString("retails.user"))
-              props.put("password", configBC.value.getString("retails.password"))
-              props.put("Driver", configBC.value.getString("retails.driver"))
-              props
-            }
-          )
-          .as[(String, Long, BigDecimal)]
-          .map { case (stockCode, itemsSold, totalProfit) => (stockCode, RetailData.ProductSummary(itemsSold, totalProfit)) }
-          .rdd
-      }
-
-    val summariesStream: DStream[(String, RetailData.ProductSummary)] = retailDataStream
-      .map(rd => rd.stockCode -> rd)
-      .mapWithState(stateSpec)
-      .cache()
-
-    summariesStream.print(20)
-    summariesStream.foreachRDD { summariesRDD =>
-      summariesRDD.foreachPartition { partition =>
-        implicit val ec: ExecutionContext = ExecutionContext.global
-        val db = Database.forConfig("retails", configBC.value)
-        try {
-          partition.foreach { case (stockCode, RetailData.ProductSummary(itemsSold, totalProfit)) =>
-            val insertSummary = db.run(ProductSummaryTable.insertOrUpdate((stockCode, itemsSold, totalProfit)))
-            Await.result(insertSummary, 5.seconds)
-          }
-        } finally {
-          db.close()
-        }
-      }
-    }
-
-
-    ssc.start()
-    ssc.awaitTermination()
   }
 }
 
